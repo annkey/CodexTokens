@@ -1,13 +1,19 @@
-# Codex Token 统计工具
+# Codex Token Dashboard
 
-一个本地运行的 Codex token 仪表盘，自动读取 `~/.codex` 下的 SQLite 日志，展示：
+一个既支持本地读取 Codex SQLite，也支持外网展示的 token 统计面板。
 
-- 每天、每周、每月 token 用量趋势
-- 今日 / 本周 / 本月 / 累计统计
-- input / output / cached / reasoning / tool token 构成
-- 累计用量最高的线程排行
+## 两种运行模式
 
-## 启动
+1. 本地模式
+- 服务器直接读取 `~/.codex/logs_1.sqlite`
+- 适合你在自己电脑上本地打开
+
+2. 外网模式
+- 服务器本身不读取本地 `.codex`
+- 通过本地 `sync.js` 把聚合后的统计结果推送到线上
+- 外网页面读取服务器保存的最新快照
+
+## 启动服务
 
 ```powershell
 npm start
@@ -19,32 +25,52 @@ npm start
 http://localhost:3210
 ```
 
-## 可选环境变量
+## 本地同步到外网
 
-- `PORT`：自定义端口
-- `CODEX_HOME`：自定义 Codex 数据目录，默认读取 `C:\Users\<用户名>\.codex`
-
-示例：
+在你自己的电脑上执行：
 
 ```powershell
-$env:PORT=4000
-$env:CODEX_HOME='C:\Users\35896\.codex'
-npm start
+$env:SYNC_TARGET_URL='https://你的域名/api/sync'
+$env:SYNC_TOKEN='你设置的同步密钥'
+npm run sync
 ```
 
-## 数据来源
+如果你本地 Codex 数据目录不是默认路径，也可以指定：
 
-- `logs_1.sqlite`：解析 `response.completed` 日志，作为日 / 周 / 月统计主数据源
-- `state_5.sqlite`：读取线程累计 `tokens_used`，用于线程排行展示
+```powershell
+$env:CODEX_HOME='C:\Users\35896\.codex'
+$env:SYNC_TARGET_URL='https://你的域名/api/sync'
+$env:SYNC_TOKEN='你设置的同步密钥'
+npm run sync
+```
 
-## 说明
+## 服务端环境变量
 
-图表总量按以下字段求和：
+- `PORT`
+- `CODEX_HOME`
+- `SYNC_TOKEN`
 
-- `input_token_count`
-- `output_token_count`
-- `cached_token_count`
-- `reasoning_token_count`
-- `tool_token_count`
+说明：
 
-如果你的 Codex 数据目录结构不同，可以通过 `CODEX_HOME` 指向新的路径。
+- 当服务器能读到本地 `.codex` 时，优先使用本地 SQLite
+- 当服务器读不到本地 `.codex` 时，会自动读取最近一次同步上来的快照
+- 如果设置了 `SYNC_TOKEN`，调用 `/api/sync` 时必须带 `Authorization: Bearer <token>`
+
+## 接口
+
+- `GET /api/usage`
+  - 获取当前展示数据
+- `POST /api/sync`
+  - 上传本地统计快照
+- `GET /api/health`
+  - 查看当前服务是否在本地模式或远程快照模式
+
+## 部署建议
+
+外网部署时推荐：
+
+1. 在线上服务配置 `SYNC_TOKEN`
+2. 本地电脑定时执行 `npm run sync`
+3. 页面始终访问线上域名
+
+这样外网页面就能展示你本机 Codex 的最新统计结果。

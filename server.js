@@ -1,4 +1,4 @@
-﻿const http = require("node:http");
+const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
@@ -7,9 +7,13 @@ const { DatabaseSync } = require("node:sqlite");
 
 const PORT = Number(process.env.PORT || 3210);
 const PUBLIC_DIR = path.join(__dirname, "public");
+const DATA_DIR = path.join(__dirname, "data");
+const SNAPSHOT_FILE = path.join(DATA_DIR, "usage-snapshot.json");
 const DEFAULT_CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const LOG_DB_PATH = path.join(DEFAULT_CODEX_HOME, "logs_1.sqlite");
 const STATE_DB_PATH = path.join(DEFAULT_CODEX_HOME, "state_5.sqlite");
+const SYNC_TOKEN = process.env.SYNC_TOKEN || "";
+const SYNC_TARGET_URL = process.env.SYNC_TARGET_URL || "";
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -21,6 +25,42 @@ const MIME_TYPES = {
 
 function getTimezone() {
   return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+}
+
+function hasLocalCodexData() {
+  return fs.existsSync(LOG_DB_PATH) && fs.existsSync(STATE_DB_PATH);
+}
+
+function ensureDataDir() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+function readStoredSnapshot() {
+  if (!fs.existsSync(SNAPSHOT_FILE)) {
+    return null;
+  }
+
+  return JSON.parse(fs.readFileSync(SNAPSHOT_FILE, "utf8"));
+}
+
+function writeStoredSnapshot(snapshot) {
+  ensureDataDir();
+  fs.writeFileSync(SNAPSHOT_FILE, `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+}
+
+function withMeta(snapshot, overrides = {}) {
+  return {
+    ...snapshot,
+    meta: {
+      source: "local",
+      syncedAt: null,
+      receivedAt: null,
+      machineName: os.hostname(),
+      mode: "local",
+      ...snapshot.meta,
+      ...overrides,
+    },
+  };
 }
 
 function getLocalDateParts(date, timeZone) {
@@ -43,9 +83,6 @@ function getLocalDateParts(date, timeZone) {
     year: Number(parts.year),
     month: Number(parts.month),
     day: Number(parts.day),
-    hour: Number(parts.hour),
-    minute: Number(parts.minute),
-    second: Number(parts.second),
   };
 }
 
@@ -64,10 +101,7 @@ function getWeekKeyFromDateKey(dateKey) {
   const utcDate = new Date(Date.UTC(year, month - 1, day));
   const dayOfWeek = utcDate.getUTCDay() || 7;
   utcDate.setUTCDate(utcDate.getUTCDate() - dayOfWeek + 1);
-  const weekYear = utcDate.getUTCFullYear();
-  const weekMonth = String(utcDate.getUTCMonth() + 1).padStart(2, "0");
-  const weekDay = String(utcDate.getUTCDate()).padStart(2, "0");
-  return `${weekYear}-${weekMonth}-${weekDay}`;
+  return `${utcDate.getUTCFullYear()}-${String(utcDate.getUTCMonth() + 1).padStart(2, "0")}-${String(utcDate.getUTCDate()).padStart(2, "0")}`;
 }
 
 function shiftDateKey(dateKey, amount) {
@@ -168,7 +202,10 @@ function sortAndLimitTotals(map, limit, formatter) {
     .slice(0, limit);
 }
 
-function buildUsageSnapshot() {
+function buildUsageSnapshot(options = {}) {
+  const codexHome = options.codexHome || DEFAULT_CODEX_HOME;
+  const logDbPath = path.join(codexHome, "logs_1.sqlite");
+  const stateDbPath = path.join(codexHome, "state_5.sqlite");
   const timeZone = getTimezone();
   const now = new Date();
   const todayKey = getDateKey(now, timeZone);
@@ -200,7 +237,7 @@ function buildUsageSnapshot() {
     allTime: createEmptyBucket("all", "all"),
   };
 
-  const logsDb = new DatabaseSync(LOG_DB_PATH, { readonly: true });
+  const logsDb = new DatabaseSync(logDbPath, { readonly: true });
   const logRows = logsDb
     .prepare(
       `SELECT feedback_log_body
@@ -220,6 +257,7 @@ function buildUsageSnapshot() {
     if (!event) {
       continue;
     }
+
     const dedupeKey = [
       event.timestamp,
       event.conversationId,
@@ -240,7 +278,7 @@ function buildUsageSnapshot() {
 
   logsDb.close();
 
-  const stateDb = new DatabaseSync(STATE_DB_PATH, { readonly: true });
+  const stateDb = new DatabaseSync(stateDbPath, { readonly: true });
   const threadRows = stateDb
     .prepare(
       `SELECT id, title, cwd, model, tokens_used, updated_at
@@ -249,6 +287,7 @@ function buildUsageSnapshot() {
        ORDER BY tokens_used DESC`,
     )
     .all();
+  stateDb.close();
 
   const threadMap = new Map(
     threadRows.map((row) => [
@@ -264,8 +303,6 @@ function buildUsageSnapshot() {
     ]),
   );
 
-  stateDb.close();
-
   let peakResponse = null;
 
   for (const event of dedupedEvents) {
@@ -275,42 +312,24 @@ function buildUsageSnapshot() {
     const weekKey = getWeekKeyFromDateKey(dateKey);
     const monthKey = getMonthKey(eventDate, timeZone);
     const thread = threadMap.get(event.conversationId);
-    const cwd = thread?.cwd || "鏈煡椤圭洰";
+    const cwd = thread?.cwd || "Unknown Project";
 
-    if (!allDailyMap.has(dateKey)) {
-      allDailyMap.set(dateKey, createEmptyBucket(dateKey, dateKey));
-    }
-    if (!allWeeklyMap.has(weekKey)) {
-      allWeeklyMap.set(weekKey, createEmptyBucket(weekKey, weekKey));
-    }
-    if (!allMonthlyMap.has(monthKey)) {
-      allMonthlyMap.set(monthKey, createEmptyBucket(monthKey, monthKey));
-    }
+    if (!allDailyMap.has(dateKey)) allDailyMap.set(dateKey, createEmptyBucket(dateKey, dateKey));
+    if (!allWeeklyMap.has(weekKey)) allWeeklyMap.set(weekKey, createEmptyBucket(weekKey, weekKey));
+    if (!allMonthlyMap.has(monthKey)) allMonthlyMap.set(monthKey, createEmptyBucket(monthKey, monthKey));
 
     addEventToBucket(allDailyMap.get(dateKey), event);
     addEventToBucket(allWeeklyMap.get(weekKey), event);
     addEventToBucket(allMonthlyMap.get(monthKey), event);
 
-    if (dailyMap.has(dateKey)) {
-      addEventToBucket(dailyMap.get(dateKey), event);
-    }
-    if (weeklyMap.has(weekKey)) {
-      addEventToBucket(weeklyMap.get(weekKey), event);
-    }
-    if (monthlyMap.has(monthKey)) {
-      addEventToBucket(monthlyMap.get(monthKey), event);
-    }
+    if (dailyMap.has(dateKey)) addEventToBucket(dailyMap.get(dateKey), event);
+    if (weeklyMap.has(weekKey)) addEventToBucket(weeklyMap.get(weekKey), event);
+    if (monthlyMap.has(monthKey)) addEventToBucket(monthlyMap.get(monthKey), event);
 
     addEventToBucket(summaries.allTime, event);
-    if (dateKey === todayKey) {
-      addEventToBucket(summaries.today, event);
-    }
-    if (weekKey === thisWeekKey) {
-      addEventToBucket(summaries.thisWeek, event);
-    }
-    if (monthKey === thisMonthKey) {
-      addEventToBucket(summaries.thisMonth, event);
-    }
+    if (dateKey === todayKey) addEventToBucket(summaries.today, event);
+    if (weekKey === thisWeekKey) addEventToBucket(summaries.thisWeek, event);
+    if (monthKey === thisMonthKey) addEventToBucket(summaries.thisMonth, event);
 
     categoryTotals.total += total;
     categoryTotals.input += event.input;
@@ -329,7 +348,7 @@ function buildUsageSnapshot() {
         timestamp: event.timestamp,
         model: event.model,
         conversationId: event.conversationId,
-        title: thread?.title || "鏈煡浼氳瘽",
+        title: thread?.title || "Unknown Thread",
       };
     }
   }
@@ -355,10 +374,10 @@ function buildUsageSnapshot() {
   const activeDays = [...allDailyMap.values()].filter((item) => item.total > 0).length;
   const cacheRatio = categoryTotals.total ? (categoryTotals.cached / categoryTotals.total) * 100 : 0;
 
-  return {
+  return withMeta({
     generatedAt: new Date().toISOString(),
     timeZone,
-    codexHome: DEFAULT_CODEX_HOME,
+    codexHome,
     summaryCards: {
       today: summaries.today,
       thisWeek: summaries.thisWeek,
@@ -386,19 +405,11 @@ function buildUsageSnapshot() {
         timestamp: "",
         model: "unknown",
         conversationId: "",
-        title: "鏈煡浼氳瘽",
+        title: "Unknown Thread",
       },
       activeDays,
-      modelRanking: sortAndLimitTotals(modelTotals, 5, (key, value) => ({
-        key,
-        label: key,
-        total: value,
-      })),
-      projectRanking: sortAndLimitTotals(cwdTotals, 5, (key, value) => ({
-        key,
-        label: key,
-        total: value,
-      })),
+      modelRanking: sortAndLimitTotals(modelTotals, 5, (key, value) => ({ key, label: key, total: value })),
+      projectRanking: sortAndLimitTotals(cwdTotals, 5, (key, value) => ({ key, label: key, total: value })),
     },
     series: {
       daily: [...dailyMap.values()],
@@ -406,12 +417,140 @@ function buildUsageSnapshot() {
       monthly: [...monthlyMap.values()],
     },
     topThreads,
-  };
+  });
+}
+
+function resolveUsageSnapshot() {
+  if (hasLocalCodexData()) {
+    return buildUsageSnapshot();
+  }
+
+  const storedSnapshot = readStoredSnapshot();
+  if (storedSnapshot) {
+    return withMeta(storedSnapshot, {
+      source: "synced",
+      mode: "remote",
+    });
+  }
+
+  throw new Error("No local Codex SQLite files found and no synced snapshot is available.");
 }
 
 function sendJson(response, statusCode, data) {
   response.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
   response.end(JSON.stringify(data));
+}
+
+function readRequestBody(request) {
+  return new Promise((resolve, reject) => {
+    let raw = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => {
+      raw += chunk;
+      if (raw.length > 5 * 1024 * 1024) {
+        reject(new Error("Request body too large."));
+        request.destroy();
+      }
+    });
+    request.on("end", () => resolve(raw));
+    request.on("error", reject);
+  });
+}
+
+function isAuthorized(request) {
+  if (!SYNC_TOKEN) {
+    return true;
+  }
+
+  const authHeader = request.headers.authorization || "";
+  return authHeader === `Bearer ${SYNC_TOKEN}`;
+}
+
+async function pushSnapshotToTarget(snapshot) {
+  if (!SYNC_TARGET_URL) {
+    throw new Error("SYNC_TARGET_URL is not configured on this server.");
+  }
+
+  const response = await fetch(SYNC_TARGET_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(SYNC_TOKEN ? { Authorization: `Bearer ${SYNC_TOKEN}` } : {}),
+    },
+    body: JSON.stringify({
+      syncedAt: new Date().toISOString(),
+      machineName: os.hostname(),
+      snapshot,
+    }),
+  });
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload.details || payload.error || `Manual sync failed with status ${response.status}`);
+  }
+
+  return payload;
+}
+
+function handleSyncRequest(request, response) {
+  if (!isAuthorized(request)) {
+    sendJson(response, 401, { error: "Unauthorized sync request." });
+    return;
+  }
+
+  readRequestBody(request)
+    .then((raw) => {
+      const payload = JSON.parse(raw || "{}");
+      if (!payload || typeof payload !== "object" || !payload.snapshot) {
+        throw new Error("Missing snapshot payload.");
+      }
+
+      const snapshot = withMeta(payload.snapshot, {
+        source: "synced",
+        mode: "remote",
+        syncedAt: payload.syncedAt || new Date().toISOString(),
+        receivedAt: new Date().toISOString(),
+        machineName: payload.machineName || payload.snapshot?.meta?.machineName || "unknown",
+      });
+
+      writeStoredSnapshot(snapshot);
+      sendJson(response, 200, {
+        ok: true,
+        savedAt: snapshot.meta.receivedAt,
+        source: snapshot.meta.source,
+      });
+    })
+    .catch((error) => {
+      sendJson(response, 400, {
+        error: "Failed to store synced snapshot.",
+        details: error.message,
+      });
+    });
+}
+
+function handleManualSyncRequest(response) {
+  if (!hasLocalCodexData()) {
+    sendJson(response, 400, {
+      error: "Manual sync is only available on a machine that can read local Codex SQLite files.",
+    });
+    return;
+  }
+
+  const snapshot = buildUsageSnapshot();
+  pushSnapshotToTarget(snapshot)
+    .then((payload) => {
+      sendJson(response, 200, {
+        ok: true,
+        syncedAt: payload.savedAt || new Date().toISOString(),
+        target: SYNC_TARGET_URL,
+      });
+    })
+    .catch((error) => {
+      sendJson(response, 400, {
+        error: "Failed to manually sync usage snapshot.",
+        details: error.message,
+      });
+    });
 }
 
 function serveStaticFile(requestPath, response) {
@@ -443,16 +582,38 @@ function createServer() {
   return http.createServer((request, response) => {
     const requestUrl = new URL(request.url, `http://${request.headers.host}`);
 
-    if (requestUrl.pathname === "/api/usage") {
+    if (request.method === "GET" && requestUrl.pathname === "/api/usage") {
       try {
-        sendJson(response, 200, buildUsageSnapshot());
+        sendJson(response, 200, resolveUsageSnapshot());
       } catch (error) {
         sendJson(response, 500, {
-          error: "Failed to read Codex usage data.",
+          error: "Failed to load usage data.",
           details: error.message,
           codexHome: DEFAULT_CODEX_HOME,
         });
       }
+      return;
+    }
+
+    if (request.method === "POST" && requestUrl.pathname === "/api/sync") {
+      handleSyncRequest(request, response);
+      return;
+    }
+
+    if (request.method === "POST" && requestUrl.pathname === "/api/manual-sync") {
+      handleManualSyncRequest(response);
+      return;
+    }
+
+    if (request.method === "GET" && requestUrl.pathname === "/api/health") {
+      sendJson(response, 200, {
+        ok: true,
+        hasLocalCodexData: hasLocalCodexData(),
+        hasStoredSnapshot: fs.existsSync(SNAPSHOT_FILE),
+        mode: hasLocalCodexData() ? "local" : "remote",
+        canManualSync: Boolean(hasLocalCodexData() && SYNC_TARGET_URL),
+        syncTargetConfigured: Boolean(SYNC_TARGET_URL),
+      });
       return;
     }
 
@@ -464,12 +625,13 @@ if (require.main === module) {
   const server = createServer();
   server.listen(PORT, () => {
     console.log(`Codex token dashboard is running at http://localhost:${PORT}`);
-    console.log(`Reading data from ${DEFAULT_CODEX_HOME}`);
+    console.log(`Default Codex data source: ${DEFAULT_CODEX_HOME}`);
+    console.log(`Mode: ${hasLocalCodexData() ? "local SQLite" : "synced snapshot fallback"}`);
   });
 }
 
 module.exports = {
   buildUsageSnapshot,
   createServer,
+  resolveUsageSnapshot,
 };
-

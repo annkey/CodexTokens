@@ -5,6 +5,7 @@
   "private": true,
   "type": "commonjs",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "sync": "node sync.js"
   }
 }
