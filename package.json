@@ -1,0 +1,10 @@
+{
+  "name": "codex-token-dashboard",
+  "version": "1.0.0",
+  "description": "Local Codex token usage dashboard with daily, weekly, and monthly charts.",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

@@ -1,0 +1,111 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Codex Token 统计面板</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="hero">
+        <article class="hero-intro">
+          <p class="eyebrow">Codex Usage Dashboard</p>
+          <h1>Token 用量统计工具</h1>
+          <p class="hero-copy">
+            自动读取本机 Codex 日志，展示每天、每周、每月 token 用量走势，以及结构占比和高消耗线程。
+          </p>
+        </article>
+
+        <article class="hero-status">
+          <div class="status-top">
+            <div>
+              <p class="meta-label">最近刷新</p>
+              <strong id="generatedAt">-</strong>
+            </div>
+            <button id="refreshButton" class="ghost-button" type="button">刷新数据</button>
+          </div>
+          <div class="status-grid">
+            <div>
+              <p class="meta-label">数据源</p>
+              <strong id="codexHome">-</strong>
+            </div>
+            <div>
+              <p class="meta-label">时区</p>
+              <strong id="timezone">-</strong>
+            </div>
+          </div>
+        </article>
+      </header>
+
+      <section id="summaryCards" class="summary-grid"></section>
+      <section id="insightGrid" class="insight-grid"></section>
+
+      <section class="content-grid">
+        <article class="panel panel-main">
+          <div class="panel-head">
+            <div>
+              <p class="panel-kicker">趋势图</p>
+              <h2 id="trendTitle">每日 Token 用量</h2>
+            </div>
+            <div class="segmented">
+              <button class="segment is-active" data-view="daily" type="button">本日</button>
+              <button class="segment" data-view="weekly" type="button">本周</button>
+              <button class="segment" data-view="monthly" type="button">本月</button>
+            </div>
+          </div>
+          <div id="chartHost" class="chart-host"></div>
+        </article>
+
+        <article class="panel panel-side">
+          <div class="panel-head">
+            <div>
+              <p class="panel-kicker">结构分析</p>
+              <h2>Token 分布</h2>
+            </div>
+          </div>
+          <div id="donutHost" class="donut-host"></div>
+          <div id="breakdown" class="breakdown-list"></div>
+        </article>
+
+        <article class="panel panel-main">
+          <div class="panel-head">
+            <div>
+              <p class="panel-kicker">线程排行</p>
+              <h2>累计用量最高的会话</h2>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>标题</th>
+                  <th>模型</th>
+                  <th>累计 Tokens</th>
+                  <th>最近更新</th>
+                </tr>
+              </thead>
+              <tbody id="threadTable"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="panel panel-side">
+          <div class="panel-head">
+            <div>
+              <p class="panel-kicker">峰值概览</p>
+              <h2>高峰区间</h2>
+            </div>
+          </div>
+          <div id="highlights" class="highlight-list"></div>
+        </article>
+      </section>
+    </div>
+
+    <template id="emptyState">
+      <div class="empty-state">当前没有可展示的 token 记录。</div>
+    </template>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
