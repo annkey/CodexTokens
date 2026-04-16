@@ -1,5 +1,5 @@
 const os = require("node:os");
-const { buildUsageSnapshot } = require("./server");
+const { buildUsageSnapshot, writeLastSyncState } = require("./server");
 
 const targetUrl = process.env.SYNC_TARGET_URL;
 const syncToken = process.env.SYNC_TOKEN || "";
@@ -30,6 +30,7 @@ async function main() {
     throw new Error(payload.details || payload.error || `Sync failed with status ${response.status}`);
   }
 
+  writeLastSyncState(new Date());
   console.log(`Synced successfully at ${payload.savedAt || "unknown time"}`);
 }
 

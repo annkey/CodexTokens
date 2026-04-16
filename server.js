@@ -9,9 +9,8 @@ const PORT = Number(process.env.PORT || 3210);
 const PUBLIC_DIR = path.join(__dirname, "public");
 const DATA_DIR = path.join(__dirname, "data");
 const SNAPSHOT_FILE = path.join(DATA_DIR, "usage-snapshot.json");
+const LAST_SYNC_STATE_FILE = path.join(DATA_DIR, "last-sync-state.json");
 const DEFAULT_CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
-const LOG_DB_PATH = path.join(DEFAULT_CODEX_HOME, "logs_1.sqlite");
-const STATE_DB_PATH = path.join(DEFAULT_CODEX_HOME, "state_5.sqlite");
 const SYNC_TOKEN = process.env.SYNC_TOKEN || "";
 const SYNC_TARGET_URL = process.env.SYNC_TARGET_URL || "";
 
@@ -27,8 +26,29 @@ function getTimezone() {
   return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 }
 
+function resolveAllLogsDbPaths(codexHome) {
+  return fs
+    .readdirSync(codexHome, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && /^logs_\d+\.sqlite$/i.test(entry.name))
+    .map((entry) => {
+      const fullPath = path.join(codexHome, entry.name);
+      const stat = fs.statSync(fullPath);
+      const match = entry.name.match(/^logs_(\d+)\.sqlite$/i);
+      return {
+        fullPath,
+        size: stat.size,
+        sequence: match ? Number(match[1]) : 0,
+      };
+    })
+    .filter((item) => item.size > 0)
+    .sort((a, b) => a.sequence - b.sequence)
+    .map((item) => item.fullPath);
+}
+
 function hasLocalCodexData() {
-  return fs.existsSync(LOG_DB_PATH) && fs.existsSync(STATE_DB_PATH);
+  const logDbPaths = resolveAllLogsDbPaths(DEFAULT_CODEX_HOME);
+  const stateDbPath = path.join(DEFAULT_CODEX_HOME, "state_5.sqlite");
+  return logDbPaths.length > 0 && fs.existsSync(stateDbPath);
 }
 
 function ensureDataDir() {
@@ -46,6 +66,21 @@ function readStoredSnapshot() {
 function writeStoredSnapshot(snapshot) {
   ensureDataDir();
   fs.writeFileSync(SNAPSHOT_FILE, `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+}
+
+function writeLastSyncState(timestamp = new Date()) {
+  ensureDataDir();
+  fs.writeFileSync(
+    LAST_SYNC_STATE_FILE,
+    `${JSON.stringify(
+      {
+        lastSuccessfulSyncUtc: timestamp.toISOString(),
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
 }
 
 function withMeta(snapshot, overrides = {}) {
@@ -204,7 +239,7 @@ function sortAndLimitTotals(map, limit, formatter) {
 
 function buildUsageSnapshot(options = {}) {
   const codexHome = options.codexHome || DEFAULT_CODEX_HOME;
-  const logDbPath = path.join(codexHome, "logs_1.sqlite");
+  const logDbPaths = resolveAllLogsDbPaths(codexHome);
   const stateDbPath = path.join(codexHome, "state_5.sqlite");
   const timeZone = getTimezone();
   const now = new Date();
@@ -237,46 +272,48 @@ function buildUsageSnapshot(options = {}) {
     allTime: createEmptyBucket("all", "all"),
   };
 
-  const logsDb = new DatabaseSync(logDbPath, { readonly: true });
-  const logRows = logsDb
-    .prepare(
-      `SELECT feedback_log_body
-       FROM logs
-       WHERE feedback_log_body IS NOT NULL
-         AND feedback_log_body LIKE '%event.kind=response.completed%'
-         AND feedback_log_body LIKE '%input_token_count=%'
-       ORDER BY ts ASC`,
-    )
-    .all();
-
   const dedupedEvents = [];
   const seen = new Set();
 
-  for (const row of logRows) {
-    const event = parseCompletedEvent(row.feedback_log_body);
-    if (!event) {
-      continue;
+  for (const logDbPath of logDbPaths) {
+    const logsDb = new DatabaseSync(logDbPath, { readonly: true });
+    const logRows = logsDb
+      .prepare(
+        `SELECT feedback_log_body
+         FROM logs
+         WHERE feedback_log_body IS NOT NULL
+           AND feedback_log_body LIKE '%event.kind=response.completed%'
+           AND feedback_log_body LIKE '%input_token_count=%'
+         ORDER BY ts ASC`,
+      )
+      .all();
+
+    for (const row of logRows) {
+      const event = parseCompletedEvent(row.feedback_log_body);
+      if (!event) {
+        continue;
+      }
+
+      const dedupeKey = [
+        event.timestamp,
+        event.conversationId,
+        event.input,
+        event.output,
+        event.cached,
+        event.reasoning,
+        event.tool,
+      ].join("|");
+
+      if (seen.has(dedupeKey)) {
+        continue;
+      }
+
+      seen.add(dedupeKey);
+      dedupedEvents.push(event);
     }
 
-    const dedupeKey = [
-      event.timestamp,
-      event.conversationId,
-      event.input,
-      event.output,
-      event.cached,
-      event.reasoning,
-      event.tool,
-    ].join("|");
-
-    if (seen.has(dedupeKey)) {
-      continue;
-    }
-
-    seen.add(dedupeKey);
-    dedupedEvents.push(event);
+    logsDb.close();
   }
-
-  logsDb.close();
 
   const stateDb = new DatabaseSync(stateDbPath, { readonly: true });
   const threadRows = stateDb
@@ -288,6 +325,15 @@ function buildUsageSnapshot(options = {}) {
     )
     .all();
   stateDb.close();
+
+  const threadTotals = threadRows.reduce(
+    (accumulator, row) => {
+      accumulator.totalTokens += row.tokens_used || 0;
+      accumulator.threadCount += 1;
+      return accumulator;
+    },
+    { totalTokens: 0, threadCount: 0 },
+  );
 
   const threadMap = new Map(
     threadRows.map((row) => [
@@ -374,6 +420,9 @@ function buildUsageSnapshot(options = {}) {
   const activeDays = [...allDailyMap.values()].filter((item) => item.total > 0).length;
   const cacheRatio = categoryTotals.total ? (categoryTotals.cached / categoryTotals.total) * 100 : 0;
 
+  summaries.allTime.total = threadTotals.totalTokens;
+  summaries.allTime.count = threadTotals.threadCount;
+
   return withMeta({
     generatedAt: new Date().toISOString(),
     timeZone,
@@ -437,7 +486,10 @@ function resolveUsageSnapshot() {
 }
 
 function sendJson(response, statusCode, data) {
-  response.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
+  response.writeHead(statusCode, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store, no-cache, must-revalidate",
+  });
   response.end(JSON.stringify(data));
 }
 
@@ -539,6 +591,7 @@ function handleManualSyncRequest(response) {
   const snapshot = buildUsageSnapshot();
   pushSnapshotToTarget(snapshot)
     .then((payload) => {
+      writeLastSyncState(new Date());
       sendJson(response, 200, {
         ok: true,
         syncedAt: payload.savedAt || new Date().toISOString(),
@@ -634,4 +687,5 @@ module.exports = {
   buildUsageSnapshot,
   createServer,
   resolveUsageSnapshot,
+  writeLastSyncState,
 };

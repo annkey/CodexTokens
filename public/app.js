@@ -320,7 +320,13 @@ async function loadDashboard() {
   refreshButton.textContent = "刷新中...";
 
   try {
-    const response = await fetch("/api/usage");
+    const response = await fetch(`/api/usage?t=${Date.now()}`, {
+      method: "GET",
+      cache: "no-store",
+      headers: {
+        "Cache-Control": "no-cache",
+      },
+    });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.details || payload.error || "加载失败");
     renderDashboard(payload);
